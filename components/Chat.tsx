@@ -1,9 +1,102 @@
+// components/Chat.tsx
+
 import React, { useState, useRef, useEffect } from 'react';
 import type { ChatMessage, PrescriptionData } from '../types';
 import { getChatResponse } from '../services/geminiService';
-import { UserIcon, HealthBotIcon, TrashIcon } from './icons';
 import { saveChatHistory, loadChatHistory, clearChatHistory } from '../utils/cookieManager';
+// Import the new icon
+import { UserIcon, HealthBotIcon, TrashIcon, MicrophoneIcon } from './icons';
 
+// --- Browser-Native Text-to-Speech (TTS) ---
+const speak = (text: string) => {
+  if (!window.speechSynthesis) {
+    console.warn("Browser does not support SpeechSynthesis.");
+    return;
+  }
+  window.speechSynthesis.cancel(); // Stop any previous speech
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = 'en-US';
+  utterance.rate = 1.0;
+  window.speechSynthesis.speak(utterance);
+};
+
+// --- Browser-Native Speech-to-Text (STT) Hook ---
+// TypeScript definitions for the Web Speech API
+interface SpeechRecognition extends EventTarget {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  start: () => void;
+  stop: () => void;
+  onresult: (event: SpeechRecognitionEvent) => void;
+  onerror: (event: SpeechRecognitionErrorEvent) => void;
+  onend: () => void;
+}
+interface SpeechRecognitionEvent { results: SpeechRecognitionResultList; }
+interface SpeechRecognitionErrorEvent { error: string; }
+declare global {
+  interface Window {
+    SpeechRecognition?: { prototype: SpeechRecognition; new(): SpeechRecognition; };
+    webkitSpeechRecognition?: { prototype: SpeechRecognition; new(): SpeechRecognition; };
+  }
+}
+
+const useSpeechRecognition = () => {
+  const [text, setText] = useState('');
+  const [isRecording, setIsRecording] = useState(false);
+  const recognitionRef = useRef<SpeechRecognition | null>(null);
+
+  useEffect(() => {
+    const SpeechRecognitionAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognitionAPI) {
+      console.warn("Browser does not support SpeechRecognition.");
+      return;
+    }
+    const recognition = new SpeechRecognitionAPI();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = 'en-US';
+
+    recognition.onresult = (event: SpeechRecognitionEvent) => {
+      let finalTranscript = '';
+      let interimTranscript = '';
+      for (let i = 0; i < event.results.length; ++i) {
+        if (event.results[i].isFinal) {
+          finalTranscript += event.results[i][0].transcript;
+        } else {
+          interimTranscript += event.results[i][0].transcript;
+        }
+      }
+      setText(finalTranscript + interimTranscript);
+    };
+    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+      console.error("Speech recognition error:", event.error);
+    };
+    recognition.onend = () => {
+      setIsRecording(false);
+    };
+    recognitionRef.current = recognition;
+  }, []);
+
+  const startRecording = () => {
+    if (recognitionRef.current && !isRecording) {
+      setText('');
+      recognitionRef.current.start();
+      setIsRecording(true);
+    }
+  };
+  const stopRecording = () => {
+    if (recognitionRef.current && isRecording) {
+      recognitionRef.current.stop();
+      setIsRecording(false);
+    }
+  };
+  return { text, isRecording, startRecording, stopRecording, setText };
+};
+// --- End of STT Hook ---
+
+
+// --- The Chat Component ---
 interface AIChatProps {
   prescriptionData: PrescriptionData | null;
   storageConsent: 'pending' | 'accepted' | 'declined';
@@ -29,26 +122,48 @@ const AIChat: React.FC<AIChatProps> = ({ prescriptionData, storageConsent }) => 
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
+  // --- Use the STT hook ---
+  const {
+    text: speechText,
+    isRecording,
+    startRecording,
+    stopRecording,
+    setText: setSpeechText
+  } = useSpeechRecognition();
+
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
-
+  
   useEffect(scrollToBottom, [messages, isLoading]);
 
   useEffect(() => {
-    // Only save if consent is given and there's more than the initial welcome message.
     if (storageConsent === 'accepted' && messages.length > 1) {
       saveChatHistory(messages);
     }
   }, [messages, storageConsent]);
 
-  const handleSendMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
+  // Update input field from speech
+  useEffect(() => {
+    if (speechText) {
+      setInput(speechText);
+    }
+  }, [speechText]);
+
+
+  const handleSendMessage = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    
     if (!input.trim() || isLoading) return;
+
+    // Stop recording and speech
+    if (isRecording) stopRecording();
+    window.speechSynthesis.cancel();
 
     const userMessage: ChatMessage = { role: 'user', content: input };
     setMessages(prev => [...prev, userMessage]);
     setInput('');
+    setSpeechText(''); // Clear speech text
     setIsLoading(true);
 
     try {
@@ -56,6 +171,10 @@ const AIChat: React.FC<AIChatProps> = ({ prescriptionData, storageConsent }) => 
       const response = await getChatResponse(chatHistory, prescriptionData);
       const modelMessage: ChatMessage = { role: 'model', content: response };
       setMessages(prev => [...prev, modelMessage]);
+
+      // --- Speak the response ---
+      speak(modelMessage.content);
+
     } catch (error) {
       console.error("Chat error:", error);
       const errorMessage: ChatMessage = {
@@ -63,6 +182,8 @@ const AIChat: React.FC<AIChatProps> = ({ prescriptionData, storageConsent }) => 
         content: "Sorry, I encountered an error. Please try again. \n\nDisclaimer: This is for informational purposes only and not a substitute for professional medical advice."
       };
       setMessages(prev => [...prev, errorMessage]);
+      // --- Speak the error ---
+      speak(errorMessage.content);
     } finally {
       setIsLoading(false);
     }
@@ -73,8 +194,19 @@ const AIChat: React.FC<AIChatProps> = ({ prescriptionData, storageConsent }) => 
       clearChatHistory();
     }
     setMessages([initialMessage]);
+    // Stop any speech/recording
+    window.speechSynthesis.cancel();
+    if (isRecording) stopRecording();
   };
 
+  // Toggle recording
+  const handleToggleRecording = () => {
+    if (isRecording) {
+      stopRecording();
+    } else {
+      startRecording();
+    }
+  };
 
   return (
     <div className="flex flex-col h-full max-h-[80vh] bg-white/50 dark:bg-slate-900/40 backdrop-blur-xl rounded-2xl shadow-lg border border-slate-200/50 dark:border-slate-700/50">
@@ -95,7 +227,7 @@ const AIChat: React.FC<AIChatProps> = ({ prescriptionData, storageConsent }) => 
           <div key={index} className={`flex items-start gap-3 ${msg.role === 'user' ? 'justify-end' : ''}`}>
             {msg.role === 'model' && (
               <div className="w-9 h-9 rounded-full bg-cyan-100 dark:bg-cyan-900/50 flex-shrink-0 flex items-center justify-center text-cyan-600 dark:text-cyan-400">
-                <HealthBotIcon className="w-5 h-5" />
+                <HealthBotIcon className="h-5 w-5" />
               </div>
             )}
             <div
@@ -128,16 +260,32 @@ const AIChat: React.FC<AIChatProps> = ({ prescriptionData, storageConsent }) => 
         )}
         <div ref={messagesEndRef} />
       </div>
+
       <form onSubmit={handleSendMessage} className="p-4 border-t border-gray-200 dark:border-slate-700">
         <div className="relative">
           <input
             type="text"
             value={input}
-            onChange={e => setInput(e.target.value)}
-            placeholder="Ask a question..."
+            onChange={e => setInput(e.targe.value)}
+            placeholder={isRecording ? "Listening..." : "Ask a question..."}
             className="w-full p-3 pr-24 rounded-full bg-slate-100 dark:bg-slate-700 border border-slate-200 dark:border-slate-600 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-cyan-500 dark:focus:ring-cyan-400 focus:border-transparent transition"
             disabled={isLoading}
           />
+          
+          <button
+            type="button"
+            onClick={handleToggleRecording}
+            className={`absolute right-[7.5rem] sm:right-24 top-1/2 -translate-y-1/2 p-2 rounded-full transition-all ${
+              isRecording 
+                ? 'text-red-500 bg-red-100/80 dark:bg-red-900/50 scale-110 animate-pulse' 
+                : 'text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-600'
+            }`}
+            title={isRecording ? "Stop recording" : "Start recording"}
+            disabled={isLoading}
+          >
+            <MicrophoneIcon className="h-5 w-5" />
+          </button>
+
           <button
             type="submit"
             disabled={isLoading || !input.trim()}
